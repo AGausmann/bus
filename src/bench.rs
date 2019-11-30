@@ -8,6 +8,7 @@ const USE_TRY_RECV: bool = false;
 const USE_TRY_SEND: bool = false;
 
 fn helper(buf: usize, iter: usize, rxs: usize) -> u64 {
+    /*
     use std::thread;
 
     let mut c = Bus::new(buf);
@@ -54,6 +55,8 @@ fn helper(buf: usize, iter: usize, rxs: usize) -> u64 {
 
     let dur = start.elapsed();
     (dur.as_secs() * 1_000_000) + u64::from(dur.subsec_micros())
+    */
+    unimplemented!()
 }
 
 fn main() {

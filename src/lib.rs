@@ -115,18 +115,18 @@
 #![cfg_attr(feature = "bench", feature(test))]
 
 use atomic_option::AtomicOption;
-use crossbeam_channel as mpsc;
-use parking_lot_core::SpinWait;
+use futures::channel::mpsc;
+use futures::future;
+use futures::stream::Stream;
 
 use std::cell::UnsafeCell;
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::atomic;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::thread;
+use std::task;
 use std::time;
-
-const SPINTIME: u32 = 100_000; //ns
 
 struct SeatState<T> {
     max: usize,
@@ -161,7 +161,7 @@ struct Seat<T> {
 
     // is the writer waiting for this seat to be emptied? needs to be atomic since both the last
     // reader and the writer might be accessing it at the same time.
-    waiting: AtomicOption<thread::Thread>,
+    waiting: AtomicOption<task::Waker>,
 }
 
 impl<T: Clone + Sync> Seat<T> {
@@ -224,7 +224,7 @@ impl<T: Clone + Sync> Seat<T> {
 
         if let Some(t) = waiting {
             // writer was waiting for us to finish with this
-            t.unpark();
+            t.wake();
         }
 
         v
@@ -267,22 +267,19 @@ pub struct Bus<T> {
     rleft: Vec<usize>,
 
     // leaving is used by receivers to signal that they are done
-    leaving: (mpsc::Sender<usize>, mpsc::Receiver<usize>),
+    leaving: (mpsc::UnboundedSender<usize>, mpsc::UnboundedReceiver<usize>),
 
     // waiting is used by receivers to signal that they are waiting for new entries, and where they
     // are waiting
     #[allow(clippy::type_complexity)]
     waiting: (
-        mpsc::Sender<(thread::Thread, usize)>,
-        mpsc::Receiver<(thread::Thread, usize)>,
+        mpsc::UnboundedSender<(task::Waker, usize)>,
+        mpsc::UnboundedReceiver<(task::Waker, usize)>,
     ),
-
-    // channel used to communicate to unparker that a given thread should be woken up
-    unpark: mpsc::Sender<thread::Thread>,
 
     // cache used to keep track of threads waiting for next write.
     // this is only here to avoid allocating one on every broadcast()
-    cache: Vec<(thread::Thread, usize)>,
+    cache: Vec<(task::Waker, usize)>,
 }
 
 impl<T> Bus<T> {
@@ -307,23 +304,12 @@ impl<T> Bus<T> {
         // work around https://github.com/rust-lang/rust/issues/59020
         let _ = time::Instant::now().elapsed();
 
-        // we run a separate thread responsible for unparking
-        // so we don't have to wait for unpark() to return in broadcast_inner
-        // sending on a channel without contention is cheap, unparking is not
-        let (unpark_tx, unpark_rx) = mpsc::unbounded::<thread::Thread>();
-        thread::spawn(move || {
-            for t in unpark_rx.iter() {
-                t.unpark();
-            }
-        });
-
         Bus {
             state: inner,
             readers: 0,
             rleft: iter::repeat(0).take(len).collect(),
             leaving: mpsc::unbounded(),
             waiting: mpsc::unbounded(),
-            unpark: unpark_tx,
 
             cache: Vec::new(),
         }
@@ -347,7 +333,7 @@ impl<T> Bus<T> {
     /// again, and the broadcast will be tried again until it succeeds.
     ///
     /// Note that broadcasts will succeed even if there are no consumers!
-    fn broadcast_inner(&mut self, val: T, block: bool) -> Result<(), T> {
+    async fn broadcast_inner(&mut self, val: T, block: bool) -> Result<(), T> {
         let tail = self.state.tail.load(atomic::Ordering::Relaxed);
 
         // we want to check if the next element over is free to ensure that we always leave one
@@ -357,21 +343,20 @@ impl<T> Bus<T> {
         // reader).
         let fence = (tail + 1) % self.state.len;
 
-        let spintime = time::Duration::new(0, SPINTIME);
+        let mut val = Some(val);
 
         // to avoid parking when a slot frees up quickly, we use an exponential back-off SpinWait.
-        let mut sw = SpinWait::new();
-        loop {
+        future::poll_fn(|cx| {
             let fence_read = self.state.ring[fence].read.load(atomic::Ordering::Acquire);
 
             // is there room left in the ring?
             if fence_read == self.expected(fence) {
-                break;
+                return task::Poll::Ready(Ok(()));
             }
 
             // no!
             // let's check if any readers have left, which might increment self.rleft[tail].
-            while let Ok(mut left) = self.leaving.1.try_recv() {
+            while let Ok(Some(mut left)) = self.leaving.1.try_next() {
                 // a reader has left! this means that every seat between `left` and `tail-1`
                 // has max set one too high. we track the number of such "missing" reads that
                 // should be ignored in self.rleft, and compensate for them when looking at
@@ -386,30 +371,26 @@ impl<T> Bus<T> {
             // is the fence block now free?
             if fence_read == self.expected(fence) {
                 // yes! go ahead and write!
-                break;
+                return task::Poll::Ready(Ok(()));
             } else if block {
                 // no, so block by parking and telling readers to notify on last read
                 self.state.ring[fence]
                     .waiting
-                    .replace(Some(Box::new(thread::current())), atomic::Ordering::Relaxed);
+                    .replace(Some(Box::new(cx.waker().clone())), atomic::Ordering::Relaxed);
 
                 // need the atomic fetch_add to ensure reader threads will see the new .waiting
                 self.state.ring[fence]
                     .read
                     .fetch_add(0, atomic::Ordering::Release);
 
-                if !sw.spin() {
-                    // not likely to get a slot soon -- wait to be unparked instead.
-                    // note that we *need* to wait, because there are some cases in which we
-                    // *won't* be unparked even though a slot has opened up.
-                    thread::park_timeout(spintime);
-                }
-                continue;
+                return task::Poll::Pending;
             } else {
                 // no, and blocking isn't allowed, so return an error
-                return Err(val);
+                return task::Poll::Ready(Err(val.take().unwrap()));
             }
-        }
+        }).await?;
+
+        let val = val.unwrap();
 
         // next one over is free, we have a free seat!
         let readers = self.readers;
@@ -438,18 +419,18 @@ impl<T> Bus<T> {
         self.state.tail.store(tail, atomic::Ordering::Release);
 
         // unblock any blocked receivers
-        while let Ok((t, at)) = self.waiting.1.try_recv() {
+        while let Ok(Some((t, at))) = self.waiting.1.try_next() {
             // the only readers we can't unblock are those that have already absorbed the
             // broadcast we just made, since they are blocking on the *next* broadcast
             if at == tail {
                 self.cache.push((t, at))
             } else {
-                self.unpark.send(t).unwrap();
+                t.wake();
             }
         }
         for w in self.cache.drain(..) {
             // fine to do here because it is guaranteed not to block
-            self.waiting.0.send(w).unwrap();
+            self.waiting.0.unbounded_send(w).unwrap();
         }
 
         Ok(())
@@ -474,8 +455,8 @@ impl<T> Bus<T> {
     /// assert_eq!(tx.try_broadcast("Hello"), Ok(()));
     /// assert_eq!(tx.try_broadcast("world"), Err("world"));
     /// ```
-    pub fn try_broadcast(&mut self, val: T) -> Result<(), T> {
-        self.broadcast_inner(val, false)
+    pub async fn try_broadcast(&mut self, val: T) -> Result<(), T> {
+        self.broadcast_inner(val, false).await
     }
 
     /// Broadcasts a value on the bus to all consumers.
@@ -487,8 +468,8 @@ impl<T> Bus<T> {
     /// receiver to receive at a later time. Furthermore, in contrast to regular channels, a bus is
     /// *not* considered closed if there are no consumers, and thus broadcasts will continue to
     /// succeed.
-    pub fn broadcast(&mut self, val: T) {
-        if let Err(..) = self.broadcast_inner(val, true) {
+    pub async fn broadcast(&mut self, val: T) {
+        if let Err(..) = self.broadcast_inner(val, true).await {
             unreachable!("blocking broadcast_inner can't fail");
         }
     }
@@ -577,8 +558,8 @@ enum RecvCondition {
 pub struct BusReader<T> {
     bus: Arc<BusInner<T>>,
     head: usize,
-    leaving: mpsc::Sender<usize>,
-    waiting: mpsc::Sender<(thread::Thread, usize)>,
+    leaving: mpsc::UnboundedSender<usize>,
+    waiting: mpsc::UnboundedSender<(task::Waker, usize)>,
     closed: bool,
 }
 
@@ -589,7 +570,7 @@ impl<T: Clone + Sync> BusReader<T> {
     /// `Err(mpsc::RecvTimeoutError::Timeout)` is returned. Otherwise, the current thread will be
     /// parked until there is another broadcast on the bus, at which point the receive will be
     /// performed.
-    fn recv_inner(&mut self, block: RecvCondition) -> Result<T, std_mpsc::RecvTimeoutError> {
+    async fn recv_inner(&mut self, block: RecvCondition) -> Result<T, std_mpsc::RecvTimeoutError> {
         if self.closed {
             return Err(std_mpsc::RecvTimeoutError::Disconnected);
         }
@@ -599,74 +580,68 @@ impl<T: Clone + Sync> BusReader<T> {
             _ => None,
         };
 
-        let spintime = time::Duration::new(0, SPINTIME);
-
         let mut was_closed = false;
-        let mut sw = SpinWait::new();
         let mut first = true;
-        loop {
-            let tail = self.bus.tail.load(atomic::Ordering::Acquire);
-            if tail != self.head {
-                break;
-            }
-
-            // buffer is empty, check whether it's closed.
-            // relaxed is fine since Bus.drop does an acquire/release on tail
-            if self.bus.closed.load(atomic::Ordering::Relaxed) {
-                // we need to check again that there's nothing in the bus, otherwise we might have
-                // missed a write between when we did the read of .tail above and when we read
-                // .closed here
-                if !was_closed {
-                    was_closed = true;
-                    continue;
+        future::poll_fn(|cx| {
+            loop {
+                let tail = self.bus.tail.load(atomic::Ordering::Acquire);
+                if tail != self.head {
+                    return task::Poll::Ready(Ok(()));
                 }
 
-                // the bus is closed, and we didn't miss anything!
-                self.closed = true;
-                return Err(std_mpsc::RecvTimeoutError::Disconnected);
-            }
+                // buffer is empty, check whether it's closed.
+                // relaxed is fine since Bus.drop does an acquire/release on tail
+                if self.bus.closed.load(atomic::Ordering::Relaxed) {
+                    // we need to check again that there's nothing in the bus, otherwise we might have
+                    // missed a write between when we did the read of .tail above and when we read
+                    // .closed here
+                    if !was_closed {
+                        was_closed = true;
+                        continue;
+                    }
 
-            // not closed, should we block?
-            if let RecvCondition::Try = block {
-                return Err(std_mpsc::RecvTimeoutError::Timeout);
-            }
-
-            // park and tell writer to notify on write
-            if first {
-                if let Err(..) = self.waiting.send((thread::current(), self.head)) {
-                    // writer has gone away, but somehow we _just_ missed the close signal (in
-                    // self.bus.closed). iterate again to ensure the channel is _actually_ empty.
-                    atomic::fence(atomic::Ordering::SeqCst);
-                    continue;
+                    // the bus is closed, and we didn't miss anything!
+                    self.closed = true;
+                    return task::Poll::Ready(Err(std_mpsc::RecvTimeoutError::Disconnected));
                 }
-                first = false;
-            }
 
-            if !sw.spin() {
+                // not closed, should we block?
+                if let RecvCondition::Try = block {
+                    return task::Poll::Ready(Err(std_mpsc::RecvTimeoutError::Timeout));
+                }
+
+                // park and tell writer to notify on write
+                if first {
+                    if let Err(..) = self.waiting.unbounded_send((cx.waker().clone(), self.head)) {
+                        // writer has gone away, but somehow we _just_ missed the close signal (in
+                        // self.bus.closed). iterate again to ensure the channel is _actually_ empty.
+                        atomic::fence(atomic::Ordering::SeqCst);
+                        continue;
+                    }
+                    first = false;
+                }
+
                 match block {
                     RecvCondition::Timeout(t) => {
                         match t.checked_sub(start.as_ref().unwrap().elapsed()) {
-                            Some(left) => {
-                                if left < spintime {
-                                    thread::park_timeout(left);
-                                } else {
-                                    thread::park_timeout(spintime);
-                                }
+                            Some(_left) => {
+                                return task::Poll::Pending;
                             }
                             None => {
                                 // So, the wake-up thread is still going to try to wake us up later
                                 // since we sent thread::current() above, but that's fine.
-                                return Err(std_mpsc::RecvTimeoutError::Timeout);
+                                // FIXME: is this true for wakers? ^^^
+                                return task::Poll::Ready(Err(std_mpsc::RecvTimeoutError::Timeout));
                             }
                         }
                     }
                     RecvCondition::Block => {
-                        thread::park_timeout(spintime);
+                        return task::Poll::Pending;
                     }
                     RecvCondition::Try => unreachable!(),
                 }
             }
-        }
+        }).await?;
 
         let head = self.head;
         let ret = self.bus.ring[head].take();
@@ -716,8 +691,8 @@ impl<T: Clone + Sync> BusReader<T> {
     ///
     /// j.join().unwrap();
     /// ```
-    pub fn try_recv(&mut self) -> Result<T, std_mpsc::TryRecvError> {
-        self.recv_inner(RecvCondition::Try).map_err(|e| match e {
+    pub async fn try_recv(&mut self) -> Result<T, std_mpsc::TryRecvError> {
+        self.recv_inner(RecvCondition::Try).await.map_err(|e| match e {
             std_mpsc::RecvTimeoutError::Disconnected => std_mpsc::TryRecvError::Disconnected,
             std_mpsc::RecvTimeoutError::Timeout => std_mpsc::TryRecvError::Empty,
         })
@@ -733,8 +708,8 @@ impl<T: Clone + Sync> BusReader<T> {
     /// this call will wake up and return `Err` to indicate that no more messages can ever be
     /// received on this channel. However, since channels are buffered, messages sent before the
     /// disconnect will still be properly received.
-    pub fn recv(&mut self) -> Result<T, std_mpsc::RecvError> {
-        match self.recv_inner(RecvCondition::Block) {
+    pub async fn recv(&mut self) -> Result<T, std_mpsc::RecvError> {
+        match self.recv_inner(RecvCondition::Block).await {
             Ok(val) => Ok(val),
             Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(std_mpsc::RecvError),
             _ => unreachable!("blocking recv_inner can't fail"),
@@ -766,19 +741,25 @@ impl<T: Clone + Sync> BusReader<T> {
     /// let timeout = Duration::from_millis(100);
     /// assert_eq!(Err(RecvTimeoutError::Timeout), rx.recv_timeout(timeout));
     /// ```
-    pub fn recv_timeout(
+    pub async fn recv_timeout(
         &mut self,
         timeout: time::Duration,
     ) -> Result<T, std_mpsc::RecvTimeoutError> {
-        self.recv_inner(RecvCondition::Timeout(timeout))
+        self.recv_inner(RecvCondition::Timeout(timeout)).await
     }
 }
 
 impl<T> BusReader<T> {
     /// Returns an iterator that will block waiting for broadcasts. It will return `None` when the
     /// bus has been closed (i.e., the `Bus` has been dropped).
-    pub fn iter(&mut self) -> BusIter<T> {
-        BusIter(self)
+    pub fn stream(&mut self) -> BusStream<T> {
+        BusStream(self)
+    }
+
+    /// Returns an owning iterator that will block waiting for broadcasts. It will return `None`
+    /// when the bus has been closed (i.e., the `Bus` has been dropped).
+    pub fn into_stream(self) -> BusIntoStream<T> {
+        BusIntoStream(self)
     }
 }
 
@@ -787,20 +768,21 @@ impl<T> Drop for BusReader<T> {
     fn drop(&mut self) {
         // we allow not checking the result here because the writer might have gone away, which
         // would result in an error, but is okay nonetheless.
-        self.leaving.send(self.head);
+        self.leaving.unbounded_send(self.head);
     }
 }
 
 /// An iterator over messages on a receiver. This iterator will block whenever `next` is called,
 /// waiting for a new message, and `None` will be returned when the corresponding channel has been
 /// closed.
-pub struct BusIter<'a, T: 'a>(&'a mut BusReader<T>);
+pub struct BusStream<'a, T: 'a>(&'a mut BusReader<T>);
 
 /// An owning iterator over messages on a receiver. This iterator will block whenever `next` is
 /// called, waiting for a new message, and `None` will be returned when the corresponding bus has
 /// been closed.
-pub struct BusIntoIter<T>(BusReader<T>);
+pub struct BusIntoStream<T>(BusReader<T>);
 
+/*
 impl<'a, T: Clone + Sync> IntoIterator for &'a mut BusReader<T> {
     type Item = T;
     type IntoIter = BusIter<'a, T>;
@@ -817,20 +799,22 @@ impl<T: Clone + Sync> IntoIterator for BusReader<T> {
     }
 }
 
-impl<'a, T: Clone + Sync> Iterator for BusIter<'a, T> {
+impl<'a, T: Clone + Sync> Stream for BusStream<'a, T> {
     type Item = T;
-    fn next(&mut self) -> Option<T> {
-        self.0.recv().ok()
+    fn poll_next(self: Pin<&mut Self>, cx: &mut task::Context) -> task::Poll<Option<T>> {
+        self.0.poll_recv(cx).map(Result::ok)
     }
 }
 
-impl<T: Clone + Sync> Iterator for BusIntoIter<T> {
+impl<T: Clone + Sync> Stream for BusIntoStream<T> {
     type Item = T;
-    fn next(&mut self) -> Option<T> {
-        self.0.recv().ok()
+    fn poll_next(self: Pin<&mut Self>, cx: &mut task::Context) -> task::Poll<Option<T>> {
+        self.0.poll_recv(cx).map(Result::ok)
     }
 }
+*/
 
+/*
 #[cfg(feature = "bench")]
 #[bench]
 fn bench_bus_one_to_one(b: &mut test::Bencher) {
@@ -895,3 +879,4 @@ fn bench_syncch_one_to_one(b: &mut test::Bencher) {
     tx.send(true).unwrap();
     j.join().unwrap();
 }
+*/
