@@ -540,6 +540,15 @@ impl<T> Bus<T> {
             closed: false,
         }
     }
+
+    /// TODO
+    pub fn read_handle(&self) -> BusReadHandle<T> {
+        BusReadHandle {
+            state: Arc::clone(&self.state),
+            leaving: self.leaving.0.clone(),
+            waiting: self.waiting.0.clone(),
+        }
+    }
 }
 
 impl<T> Drop for Bus<T> {
@@ -837,6 +846,30 @@ impl<T: Clone + Sync> Iterator for BusIntoIter<T> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         self.0.recv().ok()
+    }
+}
+
+/// TODO
+#[derive(Clone)]
+pub struct BusReadHandle<T> {
+    state: Arc<BusInner<T>>,
+    leaving: mpsc::Sender<usize>,
+    waiting: mpsc::Sender<(thread::Thread, usize)>,
+}
+
+impl<T> BusReadHandle<T> {
+
+    /// TODO
+    pub fn add_rx(&self) -> BusReader<T> {
+        *self.state.readers.lock().unwrap() += 1;
+
+        BusReader {
+            bus: Arc::clone(&self.state),
+            head: self.state.tail.load(atomic::Ordering::Relaxed),
+            leaving: self.leaving.clone(),
+            waiting: self.waiting.clone(),
+            closed: false,
+        }
     }
 }
 
