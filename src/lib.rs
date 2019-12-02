@@ -119,10 +119,11 @@ use crossbeam_channel as mpsc;
 use parking_lot_core::SpinWait;
 
 use std::cell::UnsafeCell;
+use std::mem::drop;
 use std::ops::Deref;
 use std::sync::atomic;
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time;
 
@@ -249,6 +250,7 @@ struct BusInner<T> {
     len: usize,
     tail: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
+    readers: Mutex<usize>,
 }
 
 /// `Bus` is the main interconnect for broadcast messages. It can be used to send broadcast
@@ -258,9 +260,6 @@ struct BusInner<T> {
 /// receiver will return a disconnected error.
 pub struct Bus<T> {
     state: Arc<BusInner<T>>,
-
-    // current number of readers
-    readers: usize,
 
     // rleft keeps track of readers that should be skipped for each index. we must do this because
     // .read will be < max for those indices, even though all active readers have received them.
@@ -302,6 +301,7 @@ impl<T> Bus<T> {
             tail: atomic::AtomicUsize::new(0),
             closed: atomic::AtomicBool::new(false),
             len,
+            readers: Mutex::new(0),
         });
 
         // work around https://github.com/rust-lang/rust/issues/59020
@@ -319,7 +319,6 @@ impl<T> Bus<T> {
 
         Bus {
             state: inner,
-            readers: 0,
             rleft: iter::repeat(0).take(len).collect(),
             leaving: mpsc::unbounded(),
             waiting: mpsc::unbounded(),
@@ -361,6 +360,7 @@ impl<T> Bus<T> {
 
         // to avoid parking when a slot frees up quickly, we use an exponential back-off SpinWait.
         let mut sw = SpinWait::new();
+        let mut readers_left = 0;
         loop {
             let fence_read = self.state.ring[fence].read.load(atomic::Ordering::Acquire);
 
@@ -376,7 +376,7 @@ impl<T> Bus<T> {
                 // has max set one too high. we track the number of such "missing" reads that
                 // should be ignored in self.rleft, and compensate for them when looking at
                 // seat.read above.
-                self.readers -= 1;
+                readers_left += 1;
                 while left != tail {
                     self.rleft[left] += 1;
                     left = (left + 1) % self.state.len
@@ -412,7 +412,13 @@ impl<T> Bus<T> {
         }
 
         // next one over is free, we have a free seat!
-        let readers = self.readers;
+
+        // lock `readers` to pause concurrent calls to add_rx until the tail has been updated
+        let mut readers = self.state.readers.lock().unwrap();
+
+        // update `readers` while we have it locked
+        *readers -= readers_left;
+
         {
             let next = &self.state.ring[tail];
             // we are the only writer, so no-one else can be writing. however, since we're
@@ -427,7 +433,7 @@ impl<T> Bus<T> {
             // started at later seats). thus, we are the only thread accessing this seat, and
             // so we can safely access it as mutable.
             let state = unsafe { &mut *next.state.get() };
-            state.max = readers;
+            state.max = *readers;
             state.val = Some(val);
             next.waiting.replace(None, atomic::Ordering::Relaxed);
             next.read.store(0, atomic::Ordering::Release);
@@ -436,6 +442,9 @@ impl<T> Bus<T> {
         // now tell readers that they can read
         let tail = (tail + 1) % self.state.len;
         self.state.tail.store(tail, atomic::Ordering::Release);
+
+        // it is now safe for add_rx to be called
+        drop(readers);
 
         // unblock any blocked receivers
         while let Ok((t, at)) = self.waiting.1.try_recv() {
@@ -521,7 +530,7 @@ impl<T> Bus<T> {
     /// assert_eq!(rx2.recv(), Ok("world"));
     /// ```
     pub fn add_rx(&mut self) -> BusReader<T> {
-        self.readers += 1;
+        *self.state.readers.lock().unwrap() += 1;
 
         BusReader {
             bus: Arc::clone(&self.state),
